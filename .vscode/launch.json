@@ -1,0 +1,28 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Train CoopDet3D (torchpack CLI)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/home/yang/anaconda3/envs/coopdet3d/bin/torchpack",
+            "args": [
+                "dist-run",
+                "-np", "1",
+                "python",
+                "tools/train_coop.py",
+                "configs/tumtraf_v2x/det/transfusion/secfpn/cooperative/camera+lidar/yolov8/pointpillars.yaml",
+                "--load_from",
+                "weights/coopdet3d_vi_cl_pointpillars512_2xtestgrid_yolos_transfer_learning_best.pth"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "showReturnValue": true,
+            "subProcess": true,
+            "internalConsoleOptions": "neverOpen",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}:${PYTHONPATH}"
+            }
+        }
+    ]
+}
