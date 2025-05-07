@@ -210,3 +210,6 @@ checkpoints/
 __pycache__/
 .ipynb_checkpoints/
 .DS_Store
+cuda_*.run
+runs/
+*.pth
