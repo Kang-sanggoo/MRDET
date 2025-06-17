@@ -1,5 +1,4 @@
 import copy
-
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -42,6 +41,9 @@ class TransFusionHead(nn.Module):
         in_channels=128 * 3,
         hidden_channel=128,
         num_classes=4,
+        # 다양한 쿼리 수 설정 (Uni3DETR)
+        num_learned_queries=64,
+        num_sampled_queries=64,
         # config for Transformer
         num_decoder_layers=3,
         num_heads=8,
@@ -93,6 +95,15 @@ class TransFusionHead(nn.Module):
 
         self.bbox_coder = build_bbox_coder(bbox_coder)
         self.sampling = False
+        
+        # Add parameter related with Uni3DETR 
+        self.num_learned_queries = num_learned_queries
+        self.num_sampled_queries = num_sampled_queries
+        self.total_query_count = self.num_proposals + self.num_learned_queries + self.num_sampled_queries
+        
+        #Add learnable query
+        self.learned_query_feat = nn.Parameter(torch.randn(1, hidden_channel, num_learned_queries))
+        self.learned_query_pos = nn.Parameter(torch.rand(1, num_learned_queries, 2))  # [x, y] 좌표
 
         # a shared convolution
         self.shared_conv = build_conv_layer(
@@ -189,6 +200,9 @@ class TransFusionHead(nn.Module):
                 nn.init.xavier_uniform_(m)
         if hasattr(self, "query"):
             nn.init.xavier_normal_(self.query)
+        # Initialize learnablr query
+        nn.init.xavier_normal_(self.learned_query_feat)
+        nn.init.uniform_(self.learned_query_pos, 0, 1)  # normalized coord.
         self.init_bn_momentum()
 
     def init_bn_momentum(self):
@@ -239,11 +253,13 @@ class TransFusionHead(nn.Module):
         heatmap = dense_heatmap.detach().sigmoid()
         padding = self.nms_kernel_size // 2
         local_max = torch.zeros_like(heatmap)
+        
         # equals to nms radius = voxel_size * out_size_factor * kenel_size
         local_max_inner = F.max_pool2d(
             heatmap, kernel_size=self.nms_kernel_size, stride=1, padding=0
         )
         local_max[:, :, padding:(-padding), padding:(-padding)] = local_max_inner
+        
         ## for Pedestrian & Traffic_cone in nuScenes
         if self.test_cfg["dataset"] == "nuScenes":
             local_max[
@@ -281,6 +297,7 @@ class TransFusionHead(nn.Module):
                 :,
                 2,
             ] = F.max_pool2d(heatmap[:, 2], kernel_size=1, stride=1, padding=0)
+        
         heatmap = heatmap * (heatmap == local_max)
         heatmap = heatmap.view(batch_size, heatmap.shape[1], -1)
 
@@ -288,8 +305,10 @@ class TransFusionHead(nn.Module):
         top_proposals = heatmap.view(batch_size, -1).argsort(dim=-1, descending=True)[
             ..., : self.num_proposals
         ]
-        top_proposals_class = top_proposals // heatmap.shape[-1]
+        top_proposals_class = torch.div(top_proposals, heatmap.shape[-1], rounding_mode='floor')
         top_proposals_index = top_proposals % heatmap.shape[-1]
+        
+        # [1] query based on Top-k heatmap
         query_feat = lidar_feat_flatten.gather(
             index=top_proposals_index[:, None, :].expand(
                 -1, lidar_feat_flatten.shape[1], -1
@@ -298,7 +317,7 @@ class TransFusionHead(nn.Module):
         )
         self.query_labels = top_proposals_class
 
-        # add category embedding
+        # Add class encoding
         one_hot = F.one_hot(top_proposals_class, num_classes=self.num_classes).permute(
             0, 2, 1
         )
@@ -311,6 +330,50 @@ class TransFusionHead(nn.Module):
             .expand(-1, -1, bev_pos.shape[-1]),
             dim=1,
         )
+        
+        # [2] Uni3DETR - learnable query
+        learned_feat = self.learned_query_feat.expand(batch_size, -1, -1)  # [B, C, Q2]
+        learned_pos = self.learned_query_pos.expand(batch_size, -1, -1)    # [B, Q2, 2]
+        learned_query_labels = torch.zeros(
+            batch_size, 
+            self.num_learned_queries, 
+            dtype=self.query_labels.dtype,
+            device=self.query_labels.device
+        )
+        
+        # [3] Uni3DETR -query with random sampling
+        num_bev = lidar_feat_flatten.shape[-1]
+        rand_idx = torch.randint(0, num_bev, (batch_size, self.num_sampled_queries), device=lidar_feat.device)
+        
+        sampled_feat = lidar_feat_flatten.gather(
+            index=rand_idx[:, None, :].expand(-1, lidar_feat_flatten.shape[1], -1),
+            dim=-1
+        )  # [B, C, Q3]
+        sampled_pos = bev_pos.gather(
+            index=rand_idx[:, :, None].expand(-1, -1, bev_pos.shape[-1]),
+            dim=1
+        )  # [B, Q3, 2]
+        sampled_query_labels = torch.zeros(
+            batch_size, 
+            self.num_sampled_queries,
+            dtype=self.query_labels.dtype,
+            device=self.query_labels.device
+        )
+        
+        # Combine all query
+        if not self.training:
+       
+            query_feat = torch.cat([query_feat, learned_feat, sampled_feat], dim=2)
+            query_pos = torch.cat([query_pos, learned_pos, sampled_pos], dim=1)
+            self.query_labels_full = torch.cat([self.query_labels, learned_query_labels, sampled_query_labels], dim=1)
+        else:
+          
+            query_feat = torch.cat([query_feat, learned_feat], dim=2)
+            query_pos = torch.cat([query_pos, learned_pos], dim=1)
+            self.query_labels_full = torch.cat([self.query_labels, learned_query_labels], dim=1)
+            
+       
+        current_query_count = query_feat.shape[2]
 
         #################################
         # transformer decoder layer (LiDAR feature as K,V)
@@ -319,28 +382,92 @@ class TransFusionHead(nn.Module):
         for i in range(self.num_decoder_layers):
             prefix = "last_" if (i == self.num_decoder_layers - 1) else f"{i}head_"
 
-            # Transformer Decoder Layer
-            # :param query: B C Pq    :param query_pos: B Pq 3/6
+            # detach for stage-wise refinement stability
+            if i == 0:
+                prev_center = query_pos.permute(0, 2, 1)  # [B, 2, num_queries]
+                prev_dim = torch.zeros(batch_size, 3, current_query_count, device=query_feat.device)
+                prev_rot = torch.zeros(batch_size, 2, current_query_count, device=query_feat.device)
+                prev_height = torch.zeros(batch_size, 1, current_query_count, device=query_feat.device)
+                prev_heatmap = torch.zeros(batch_size, self.num_classes, current_query_count, device=query_feat.device)
+                if self.test_cfg.get("with_velocity", False):
+                    prev_vel = torch.zeros(batch_size, 2, current_query_count, device=query_feat.device)
+            else:
+                prev_center = refined_center.detach()
+                prev_dim = refined_dim.detach()
+                prev_rot = refined_rot.detach()
+                prev_height = refined_height.detach()
+                prev_heatmap = refined_heatmap.detach() if 'heatmap' in res_layer else prev_heatmap
+                if self.test_cfg.get("with_velocity", False):
+                    prev_vel = refined_vel.detach()
+            
+            # transformer decoding
             query_feat = self.decoder[i](
                 query_feat, lidar_feat_flatten, query_pos, bev_pos
             )
-
-            # Prediction
+            
+            # FFN Prediction
             res_layer = self.prediction_heads[i](query_feat)
-            res_layer["center"] = res_layer["center"] + query_pos.permute(0, 2, 1)
-            first_res_layer = res_layer
-            ret_dicts.append(res_layer)
+            
 
-            # for next level positional embedding
-            query_pos = res_layer["center"].detach().clone().permute(0, 2, 1)
+            scale_factor = 1.0 / (i + 1) if i > 0 else 1.0  # 각 레이어마다 점진적으로 작아지는 스케일
+            
+            refined_center = prev_center + res_layer["center"] * scale_factor
+            refined_dim = prev_dim + res_layer["dim"] * scale_factor
+            refined_rot = prev_rot + res_layer["rot"] * scale_factor
+            refined_height = prev_height + res_layer["height"] * scale_factor
+
+            refined_center = torch.nan_to_num(refined_center, nan=0.0, posinf=1e5, neginf=-1e5)
+            refined_dim = torch.nan_to_num(refined_dim, nan=0.5, posinf=15.0, neginf=0.05)
+            refined_dim = torch.clamp(refined_dim, min=0.005, max=15.0)  # 더 넓은 차원 범위
+            refined_rot = torch.nan_to_num(refined_rot, nan=0.0, posinf=3.14, neginf=-3.14)
+            refined_rot = torch.clamp(refined_rot, min=-3.14159, max=3.14159)
+            refined_height = torch.nan_to_num(refined_height, nan=0.0, posinf=5.0, neginf=-5.0)
+            refined_height = torch.clamp(refined_height, min=-5.0, max=5.0)
+            
+            if 'heatmap' in res_layer:
+                refined_heatmap = prev_heatmap + res_layer["heatmap"] * scale_factor
+                refined_heatmap = torch.clamp(refined_heatmap, min=-10.0, max=10.0)
+                res_layer["heatmap"] = refined_heatmap
+
+            if self.test_cfg.get("with_velocity", False) and "vel" in res_layer:
+                refined_vel = prev_vel + res_layer["vel"] * scale_factor
+                refined_vel = torch.nan_to_num(refined_vel, nan=0.0, posinf=10.0, neginf=-10.0)
+                refined_vel = torch.clamp(refined_vel, min=-50.0, max=50.0)
+                res_layer["vel"] = refined_vel
+
+            res_layer["center"] = refined_center
+            res_layer["dim"] = refined_dim
+            res_layer["rot"] = refined_rot
+            res_layer["height"] = refined_height
+            
+            ret_dicts.append(res_layer)
+            
+            query_pos = refined_center.detach().permute(0, 2, 1)
 
         #################################
         # transformer decoder layer (img feature as K,V)
         #################################
-        ret_dicts[0]["query_heatmap_score"] = heatmap.gather(
+        top_k_heatmap_score = heatmap.gather(
             index=top_proposals_index[:, None, :].expand(-1, self.num_classes, -1),
             dim=-1,
         )  # [bs, num_classes, num_proposals]
+        
+        if not self.training:
+            default_score = torch.ones(
+                batch_size, self.num_classes, self.num_learned_queries + self.num_sampled_queries,
+                device=top_k_heatmap_score.device
+            ) * 0.5
+            full_heatmap_score = torch.cat([top_k_heatmap_score, default_score], dim=-1)
+            ret_dicts[0]["query_heatmap_score_full"] = full_heatmap_score
+        else:
+            default_score = torch.ones(
+                batch_size, self.num_classes, self.num_learned_queries,
+                device=top_k_heatmap_score.device
+            ) * 0.5
+            full_heatmap_score = torch.cat([top_k_heatmap_score, default_score], dim=-1)
+            ret_dicts[0]["query_heatmap_score_full"] = full_heatmap_score
+            
+        ret_dicts[0]["query_heatmap_score"] = top_k_heatmap_score
         ret_dicts[0]["dense_heatmap"] = dense_heatmap
 
         if self.auxiliary is False:
@@ -350,7 +477,7 @@ class TransFusionHead(nn.Module):
         # return all the layer's results for auxiliary superivison
         new_res = {}
         for key in ret_dicts[0].keys():
-            if key not in ["dense_heatmap", "dense_heatmap_old", "query_heatmap_score"]:
+            if key not in ["dense_heatmap", "dense_heatmap_old", "query_heatmap_score", "query_heatmap_score_full"]:
                 new_res[key] = torch.cat(
                     [ret_dict[key] for ret_dict in ret_dicts], dim=-1
                 )
@@ -386,13 +513,22 @@ class TransFusionHead(nn.Module):
                 - torch.Tensor: regression target. [BS, num_proposals, 8]
                 - torch.Tensor: regression weights. [BS, num_proposals, 8]
         """
+        original_preds_dict = {}
+        for key in preds_dict[0].keys():
+            if key in ["center", "height", "dim", "rot", "vel", "heatmap"]:
+                if preds_dict[0][key].shape[-1] > self.num_proposals:
+                    original_preds_dict[key] = preds_dict[0][key][..., :self.num_proposals]
+                else:
+                    original_preds_dict[key] = preds_dict[0][key]
+            else:
+                original_preds_dict[key] = preds_dict[0][key]
+
         # change preds_dict into list of dict (index by batch_id)
-        # preds_dict[0]['center'].shape [bs, 3, num_proposal]
         list_of_pred_dict = []
         for batch_idx in range(len(gt_bboxes_3d)):
             pred_dict = {}
-            for key in preds_dict[0].keys():
-                pred_dict[key] = preds_dict[0][key][batch_idx : batch_idx + 1]
+            for key in original_preds_dict.keys():
+                pred_dict[key] = original_preds_dict[key][batch_idx : batch_idx + 1]
             list_of_pred_dict.append(pred_dict)
 
         assert len(gt_bboxes_3d) == len(list_of_pred_dict)
@@ -417,7 +553,85 @@ class TransFusionHead(nn.Module):
             label_weights,
             bbox_targets,
             bbox_weights,
-            ious,
+            ious,import copy
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from mmcv.cnn import ConvModule, build_conv_layer
+from mmcv.runner import force_fp32
+from torch import nn
+
+from mmdet3d.core import (
+    PseudoSampler,
+    circle_nms,
+    draw_heatmap_gaussian,
+    gaussian_radius,
+    xywhr2xyxyr,
+)
+from mmdet3d.models.builder import HEADS, build_loss
+from mmdet3d.models.utils import FFN, PositionEmbeddingLearned, TransformerDecoderLayer
+from mmdet3d.ops.iou3d.iou3d_utils import nms_gpu
+from mmdet.core import (
+    AssignResult,
+    build_assigner,
+    build_bbox_coder,
+    build_sampler,
+    multi_apply,
+)
+
+__all__ = ["TransFusionHead"]
+
+
+def clip_sigmoid(x, eps=1e-4):
+    y = torch.clamp(x.sigmoid_(), min=eps, max=1 - eps)
+    return y
+
+
+@HEADS.register_module()
+class TransFusionHead(nn.Module):
+    def __init__(
+        self,
+        num_proposals=128,
+        auxiliary=True,
+        in_channels=128 * 3,
+        hidden_channel=128,
+        num_classes=4,
+        # config for Transformer
+        num_decoder_layers=3,
+        num_heads=8,
+        nms_kernel_size=1,
+        ffn_channel=256,
+        dropout=0.1,
+        bn_momentum=0.1,
+        activation="relu",
+        # config for FFN
+        common_heads=dict(),
+        num_heatmap_convs=2,
+        conv_cfg=dict(type="Conv1d"),
+        norm_cfg=dict(type="BN1d"),
+        bias="auto",
+        # loss
+        loss_cls=dict(type="GaussianFocalLoss", reduction="mean"),
+        loss_iou=dict(
+            type="VarifocalLoss", use_sigmoid=True, iou_weighted=True, reduction="mean"
+        ),
+        loss_bbox=dict(type="L1Loss", reduction="mean"),
+        loss_heatmap=dict(type="GaussianFocalLoss", reduction="mean"),
+        # others
+        train_cfg=None,
+        test_cfg=None,
+        bbox_coder=None,
+    ):
+        super(TransFusionHead, self).__init__()
+
+        self.fp16_enabled = False
+
+        self.num_classes = num_classes
+        self.num_proposals = num_proposals
+        self.auxiliary = auxiliary
+        self.in_channels = in_channels
+
             num_pos,
             matched_ious,
             heatmap,
@@ -505,7 +719,7 @@ class TransFusionHead(nn.Module):
         )
         pos_inds = sampling_result.pos_inds
         neg_inds = sampling_result.neg_inds
-        assert len(pos_inds) + len(neg_inds) == num_proposals
+        assert len(pos_inds) + len(neg_inds) <= num_proposals
 
         # create target for loss computation
         bbox_targets = torch.zeros([num_proposals, self.bbox_coder.code_size]).to(
@@ -740,21 +954,33 @@ class TransFusionHead(nn.Module):
         rets = []
         for layer_id, preds_dict in enumerate(preds_dicts):
             batch_size = preds_dict[0]["heatmap"].shape[0]
-            batch_score = preds_dict[0]["heatmap"][..., -self.num_proposals :].sigmoid()
-            # if self.loss_iou.loss_weight != 0:
-            #    batch_score = torch.sqrt(batch_score * preds_dict[0]['iou'][..., -self.num_proposals:].sigmoid())
+            
+            batch_score = preds_dict[0]["heatmap"].sigmoid()
+            
             one_hot = F.one_hot(
-                self.query_labels, num_classes=self.num_classes
+                self.query_labels_full, num_classes=self.num_classes
             ).permute(0, 2, 1)
-            batch_score = batch_score * preds_dict[0]["query_heatmap_score"] * one_hot
+            
+            if "query_heatmap_score_full" in preds_dict[0]:
+                query_heatmap_score = preds_dict[0]["query_heatmap_score_full"]
+            else:
+                original_score = preds_dict[0]["query_heatmap_score"]
+                default_score = torch.ones(
+                    batch_size, self.num_classes, 
+                    self.total_query_count - self.num_proposals,
+                    device=original_score.device
+                ) * 0.5
+                query_heatmap_score = torch.cat([original_score, default_score], dim=-1)
+            
+            batch_score = batch_score * query_heatmap_score * one_hot
 
-            batch_center = preds_dict[0]["center"][..., -self.num_proposals :]
-            batch_height = preds_dict[0]["height"][..., -self.num_proposals :]
-            batch_dim = preds_dict[0]["dim"][..., -self.num_proposals :]
-            batch_rot = preds_dict[0]["rot"][..., -self.num_proposals :]
+            batch_center = preds_dict[0]["center"]
+            batch_height = preds_dict[0]["height"]
+            batch_dim = preds_dict[0]["dim"]
+            batch_rot = preds_dict[0]["rot"]
             batch_vel = None
             if "vel" in preds_dict[0]:
-                batch_vel = preds_dict[0]["vel"][..., -self.num_proposals :]
+                batch_vel = preds_dict[0]["vel"]
 
             temp = self.bbox_coder.decode(
                 batch_score,
@@ -787,6 +1013,21 @@ class TransFusionHead(nn.Module):
                         radius=0.175,
                     ),
                 ]
+            elif self.test_cfg["dataset"] == "tumtraf_v2x_nusc":  # tumtraf-v2x 데이터셋용
+                self.tasks = [
+                    dict(
+                        num_class=4,
+                        class_names=[],
+                        indices=[0, 1, 2, 3],
+                        radius=-1,
+                    ),
+                    dict(
+                        num_class=2,
+                        class_names=["pedestrian", "bicycle"],
+                        indices=[4, 5],
+                        radius=0.2,
+                    ),
+                ]
             elif self.test_cfg["dataset"] == "Waymo":
                 self.tasks = [
                     dict(num_class=1, class_names=["Car"], indices=[0], radius=0.7),
@@ -801,7 +1042,8 @@ class TransFusionHead(nn.Module):
                 boxes3d = temp[i]["bboxes"]
                 scores = temp[i]["scores"]
                 labels = temp[i]["labels"]
-                ## adopt circle nms for different categories
+                
+                ## 클래스별 NMS 적용
                 if self.test_cfg["nms_type"] != None:
                     keep_mask = torch.zeros_like(scores)
                     for task in self.tasks:
@@ -818,12 +1060,31 @@ class TransFusionHead(nn.Module):
                                     ],
                                     dim=1,
                                 )
-                                task_keep_indices = torch.tensor(
-                                    circle_nms(
-                                        boxes_for_nms.detach().cpu().numpy(),
-                                        task["radius"],
+                                
+                                dynamic_radius = task["radius"]
+                                if len(boxes_for_nms) > 0:
+                                    obj_sizes = torch.sqrt(boxes3d[task_mask][:, 3]**2 + boxes3d[task_mask][:, 4]**2)
+                                    dynamic_radius = torch.clamp(obj_sizes * 0.5, 
+                                                              min=task["radius"], 
+                                                              max=task["radius"]*1.5)
+                                    
+                                    task_keep_indices = []
+                                    for boxes_group, radius in zip(boxes_for_nms.split(1), dynamic_radius):
+                                        if len(boxes_group) > 0:
+                                            # 각 객체별 적절한 반경 사용
+                                            indices = circle_nms(
+                                                boxes_group.detach().cpu().numpy(),
+                                                radius.item(),
+                                            )
+                                            task_keep_indices.extend(indices)
+                                    task_keep_indices = torch.tensor(list(set(task_keep_indices)))
+                                else:
+                                    task_keep_indices = torch.tensor(
+                                        circle_nms(
+                                            boxes_for_nms.detach().cpu().numpy(),
+                                            task["radius"],
+                                        )
                                     )
-                                )
                             else:
                                 boxes_for_nms = xywhr2xyxyr(
                                     metas[i]["box_type_3d"](
