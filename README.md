@@ -340,6 +340,5 @@ For split, naturally one could also choose "train" or "val". For mode, the other
 
 ## Acknowledgement 🤝 
 
-The codebase is built upon [BEVFusion](https://github.com/mit-han-lab/bevfusion) with vehicle-infrastructure fusion inspired by the method proposed in [PillarGrid](https://arxiv.org/pdf/2203.06319.pdf).
-
+The codebase is built upon [TUMTraf V2X Cooperative Perception Dataset](https://github.com/tum-traffic-dataset/coopdet3d)
 
