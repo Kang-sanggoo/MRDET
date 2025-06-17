@@ -341,7 +341,9 @@ For split, naturally one could also choose "train" or "val". For mode, the other
 ## Acknowledgement 🤝 
 
 The codebase is built upon 
-[TUMTraf V2X Cooperative Perception Dataset](https://github.com/tum-traffic-dataset/coopdet3d)
-[Uni3DETR: Unified 3D Detection Transformer](https://github.com/zhenyuw16/Uni3DETR)
+[TUMTraf V2X Cooperative Perception Dataset](https://github.com/tum-traffic-dataset/coopdet3d)  
+
+[Uni3DETR: Unified 3D Detection Transformer](https://github.com/zhenyuw16/Uni3DETR)  
+
 [BEVFusion: Multi-Task Multi-Sensor Fusion with Unified Bird’s-Eye View Representation](https://github.com/mit-han-lab/bevfusion)
 
