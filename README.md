@@ -1,22 +1,7 @@
 # Mixture Query Enhanced Transformer for V2X 3D Object Detection
 <div align="center">
 <a href="https://tum-traffic-dataset.github.io/tumtraf-v2x"><img src="https://img.shields.io/badge/Website-CoopDet3D-0065BD.svg" alt="Website Badge"/></a>
-<a href="https://innovation-mobility.com/en/project-providentia/a9-dataset/#anchor_release_4"><img src="https://img.shields.io/badge/Dataset-TUMTraf_V2X-0065BD.svg?style=flat&logo=github&logoColor=white" alt="Github Badge"/></a>
-<a href="https://github.com/tum-traffic-dataset/tum-traffic-dataset-dev-kit"><img src="https://img.shields.io/badge/Dev_Kit-code-E37222.svg?style=flat&logo=github&logoColor=white" alt="Github Badge"/></a>
-<a href="https://arxiv.org/pdf/2403.01316.pdf"><img src="https://img.shields.io/badge/Paper-TUMTraf_V2X-a2ad00.svg" alt="Paper Badge"/></a>
 
-<a href="https://github.com/walzimmer/3d-bat"><img src="https://img.shields.io/badge/Labeling_Tool-3D_BAT-BC4E99.svg?style=flat&logo=github" alt="Paper Badge"/></a>
-<a href="https://ieeexplore.ieee.org/document/8814071"><img src="https://img.shields.io/badge/Paper-3D_BAT-0E2B3A.svg?style=flat&logo=ieee" alt="Paper Badge"/></a>
-<a href="https://github.com/walzimmer/3d-bat/stargazers"><img src="https://img.shields.io/github/stars/tum-traffic-dataset/coopdet3d" alt="Stars Badge"/></a>
-<a href="https://github.com/walzimmer/3d-bat/network/members"><img src="https://img.shields.io/github/forks/tum-traffic-dataset/coopdet3d" alt="Forks Badge"/></a>
-<a href="https://github.com/walzimmer/3d-bat/pulls"><img src="https://img.shields.io/github/issues-pr/tum-traffic-dataset/coopdet3d" alt="Pull Requests Badge"/></a>
-<a href="https://github.com/walzimmer/3d-bat/issues"><img src="https://img.shields.io/github/issues/tum-traffic-dataset/coopdet3d" alt="Issues Badge"/></a>
-<a href="https://a9-dataset.innovation-mobility.com/license"><img src="https://img.shields.io/badge/license-custom-2b9348.svg" alt="Issues Badge"/></a>
-</div>
-
-<p align="center">
-<img src="imgs/coopdet3d_architecture_v2.png" width="1000" alt="" class="img-responsive">
-</p>
 
 ## Abstract
 
