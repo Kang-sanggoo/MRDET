@@ -10,7 +10,7 @@ Existing V2X-based 3D object detection models primarily employ complex convoluti
 
 
 ## News 📢
-- 2025/6: Ranked 4th on the leaderboard (https://eval.ai/web/challenges/challenge-page/2476/leaderboard/6145)
+- 2025/6: Ranked 3rd on the leaderboard (https://eval.ai/web/challenges/challenge-page/2476/leaderboard/6145)
 
 ## Dataset Download 📂
 
